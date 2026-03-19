@@ -13,9 +13,8 @@ def get_playlist_id():
     with open('Youtube-API-ETL/api_result.json', 'r+') as file:
         data = json.load(file)
         last_call_date = datetime.strptime(data['call_date'], '%Y-%m-%d').date()
-        # print(f'last call date: {last_call_date}')
         current_date = date.today()
-        # print(f'current date:{current_date}')
+        
         if current_date > last_call_date:
             try:
                 url = f'https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={CHANNEL_HANDLER}&key={YOUR_API_KEY}'
@@ -41,4 +40,3 @@ def get_playlist_id():
                 
 if __name__ == "__main__":   
     result = get_playlist_id()
-    print(result)
