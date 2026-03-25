@@ -1,107 +1,144 @@
-import requests, json, os
-from  datetime import date, datetime
+import requests, json, os, re
+from datetime import date, datetime
 from dotenv import load_dotenv
 
 
-load_dotenv(dotenv_path="./.env")
+
+load_dotenv()
 
 YOUR_API_KEY = os.getenv("YOUR_API_KEY")
 CHANNEL_HANDLER = os.getenv("CHANNEL_HANDLER")
-MAX_RESULT = os.getenv("MAX_RESULT")
+MAX_RESULT = os.getenv("MAX_RESULT", "50")
 
 
-def json_data(file, url, append_data=None, current_date=None):
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        new_data = response.json()
-        if append_data and current_date:
-            new_data['call_date'] = str(current_date)
-        file.seek(0)
-        file.truncate()
-        json.dump(new_data, file, indent=4)
-        data = new_data 
-    except Exception as e:
-        raise e
+def load_json(path):
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def save_json(path, data):
+    with open(path, 'w') as file:
+        json.dump(data, file, indent=4)
+        
+
+def format_duration(ISO_duration):
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.search(pattern, ISO_duration)
+    
+    if not match:
+        return "0:00"
+    
+    h = int(match.group(1) or 0)
+    m = int(match.group(2) or 0)
+    s = int(match.group(3) or 0)
+    
+    if int(h) > 0:
+        return f"{h}:{int(m):02d}:{int(s):02d}"
+    return f"{m}:{int(s):02d}"
 
 
 def get_playlist_id(current_date):
-    with open('./playlist_id.json', 'r+') as file:
-        data = json.load(file)
-        last_call_date = datetime.strptime(data['call_date'], '%Y-%m-%d').date()
-        if current_date > last_call_date:
-            url = f'https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={CHANNEL_HANDLER}&key={YOUR_API_KEY}'
-            json_data(file, url, True, current_date)
-            
-    if data.get('items'):
-        channel_playlistid = data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
-        return channel_playlistid, last_call_date
-    else:
-        return None, None
-
-
-def playlist(current_date):
-    playlist_id,last_call_date  = get_playlist_id(current_date)
-    if playlist_id:
-        with open("./playlist.json", "r+") as file:
-            if current_date > last_call_date:
-                url = f"https://youtube.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults={MAX_RESULT}&playlistId={playlist_id}&key={YOUR_API_KEY}"
-                json_data(file, url)
-                
-            else:
-                print("Date is still current in playlist.")
-                data = json.load(file)
-                
-
-def get_playlist_video_ids(current_date):
-    playlist_id, last_call_date = get_playlist_id(current_date)
-    if not playlist_id:
-        print("No playlist ID found.")
-        return None
+    path = './playlist_id.json'
+    data = load_json(path)
     
-    playlist_path = "./playlist.json"
+    # Check if we need to refresh (if date is missing or old)
+    last_call_str = data.get('call_date', '1900-01-01')
+    last_call_date = datetime.strptime(last_call_str, '%Y-%m-%d').date()
+
+    if current_date > last_call_date:
+        url = f'https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={CHANNEL_HANDLER}&key={YOUR_API_KEY}'
+        response = requests.get(url)
+        response.raise_for_status()
+        new_data = response.json()
+        
+        if 'items' in new_data:
+            new_data['call_date'] = str(current_date)
+            save_json(path, new_data)
+            return new_data['items'][0]['contentDetails']['relatedPlaylists']['uploads'], last_call_date
+    
+    return data['items'][0]['contentDetails']['relatedPlaylists']['uploads'], last_call_date
+
+
+def get_playlist_video_ids(current_date, playlist_id, last_call_date):
+    path = "./playlist.json"
     
     if current_date > last_call_date:
-        print("Fetching new playlist data...")
-        all_video_details = []
+        print("Fetching fresh playlist items...")
+        all_videos = []
         page_token = None
-            
+        
         while True:
             params = {
                 "part": "contentDetails",
-                "maxResults": MAX_RESULT, 
+                "maxResults": MAX_RESULT,
                 "playlistId": playlist_id,
-                "key": YOUR_API_KEY
+                "key": YOUR_API_KEY,
+                "pageToken": page_token
             }
-            if page_token:
-                params["pageToken"] = page_token
-            
             response = requests.get("https://www.googleapis.com/youtube/v3/playlistItems", params=params)
             response.raise_for_status()
             data = response.json()
             
-            for item in data.get("items", []):
-                all_video_details.append(item["contentDetails"])
-                
+            all_videos.extend([item["contentDetails"]["videoId"] for item in data.get("items", [])])
             page_token = data.get("nextPageToken")
-                    
-            if not page_token:
-                new_data = {"Video Details": all_video_details}
-                with open(playlist_path, "w") as file:
-                    json.dump(new_data, file, indent=4)
-                return new_data
-    else:
-        print("Loading playlist from cache.")
-        with open(playlist_path, "r") as file:
-            return json.load(file)
+            if not page_token: break
+            
+        save_json(path, {"video_ids": all_videos})
+        return all_videos
+    
+    return load_json(path).get("video_ids", [])
 
 
-def youTube_stats():
-    current_date = date.today()
-    data = get_playlist_video_ids(current_date)
-    print(f"Retrieved {len(data.get('Video Details', []))} videos.")
+def fetch_full_video_details(video_ids):
+    print(f"Fetching details for {len(video_ids)} videos...")
+    all_details = []
+    
+    for index in range(0, len(video_ids), 50):
+        chunk_id = video_ids[index:index+50]
+        params = {
+            "part": "snippet,statistics,contentDetails",
+            "id": ",".join(chunk_id),
+            "key": YOUR_API_KEY
+        }
+        response = requests.get("https://www.googleapis.com/youtube/v3/videos", params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        for item in data.get("items", []):
+            statistics = item.get("statistics", {})
+            video_data = {
+                "video_id" : item["id"],
+                "channelTitle" : item["snippet"]["channelTitle"],
+                "title" : item["snippet"]["title"],
+                "publishedAt" : item["snippet"]["publishedAt"],
+                "description" : item["snippet"]["description"],
+                "duration" : format_duration(item["contentDetails"]["duration"]),
+                "viewCount" : statistics.get("viewCount", "0"),
+                "likeCount" : statistics.get("likeCount", "0"),
+                "commentCount" : statistics.get("commentCount", "0")
+            }
+            
+            all_details.append(video_data)
+    
+    save_json("./video_data.json", all_details)
+    return all_details
 
-
+def youtube_stats():
+    today = date.today()
+    try:
+        playlist_id, last_date = get_playlist_id(today)
+        video_ids = get_playlist_video_ids(today, playlist_id, last_date)
+        
+        if today > last_date:
+            fetch_full_video_details(video_ids)
+            print("Data updated successfully.")
+        else:
+            print("Cache is up to date.")
+            
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":   
-    youTube_stats()
+    youtube_stats()
