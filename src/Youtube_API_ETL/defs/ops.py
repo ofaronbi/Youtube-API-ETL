@@ -1,12 +1,13 @@
 import dagster as dg
 import requests
+import os
 from ..helper import *
 
 
 
-YOUR_API_KEY = dg.EnvVar("YOUR_API_KEY")
-CHANNEL_HANDLER = dg.EnvVar("CHANNEL_HANDLER")
-MAX_RESULT = dg.EnvVar("MAX_RESULT")
+YOUR_API_KEY = os.getenv("YOUR_API_KEY")
+CHANNEL_HANDLER = os.getenv("CHANNEL_HANDLER")
+MAX_RESULT = int(os.getenv("MAX_RESULT", 50))
 
 
 class CURRENTDATE(dg.Config):
@@ -14,7 +15,11 @@ class CURRENTDATE(dg.Config):
         
 
 
-@dg.op
+@dg.op(out={
+    'current_date': dg.Out(), 
+    'playlist_id' : dg.Out(),
+    'last_call_date' : dg.Out()
+})
 def get_playlist_id(config:CURRENTDATE):
     path = './playlist_id.json'
     data = load_json(path)
@@ -33,9 +38,11 @@ def get_playlist_id(config:CURRENTDATE):
         if 'items' in new_data:
             new_data['call_date'] = str(current_date)
             save_json(path, new_data)
-            return new_data['items'][0]['contentDetails']['relatedPlaylists']['uploads'], last_call_date
+            data = new_data
     
-    return current_date, data['items'][0]['contentDetails']['relatedPlaylists']['uploads'], last_call_date
+    yield dg.Output(current_date, 'current_date')
+    yield dg.Output(data['items'][0]['contentDetails']['relatedPlaylists']['uploads'], 'playlist_id')
+    yield dg.Output(last_call_date, 'last_call_date')
 
 
 @dg.op
@@ -107,9 +114,7 @@ def fetch_full_video_details(video_ids):
 
 @dg.graph_asset(name='YouTube_video_statistic',kinds=['Python', 'PostgreSQL'], owners=['team:Opeyemi-Faronbi'], group_name='YouTube_stats')
 def youtube_stats():
-    return fetch_full_video_details(
-        get_playlist_video_ids(
-            get_playlist_id()
-            )
-        )
+    current_date, playlist_id, last_call_date = get_playlist_id()
+    video_ids = get_playlist_video_ids(current_date, playlist_id, last_call_date)
+    return fetch_full_video_details(video_ids)
     
