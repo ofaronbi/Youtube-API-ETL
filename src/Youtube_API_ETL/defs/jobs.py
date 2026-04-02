@@ -1,5 +1,5 @@
 import dagster as dg
-from .ops import youtube_stats
+from .assets import youtube_stats
 
 
 youTube_stat_job = dg.define_asset_job(
