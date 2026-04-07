@@ -1,20 +1,33 @@
 import dagster as dg
 import os
 from datetime import date, datetime, timezone
-from ..helper import load_json, str_to_date
-
+from ..helper import str_to_date
 
 
 runtime = int(os.getenv("INTERVAL", 150))
 
-
-@dg.sensor(job_name='YouTube_stat_job', minimum_interval_seconds=runtime, default_status=dg.DefaultSensorStatus.RUNNING)
+@dg.sensor(
+    job_name='YouTube_stat_job', 
+    minimum_interval_seconds=runtime, 
+    default_status=dg.DefaultSensorStatus.RUNNING, 
+    required_resource_keys={'postgres_db'}
+    )
 def youtube_stats(context: dg.SensorEvaluationContext):
+    
+    db_conn = context.resources.postgres_db
+    
+    with db_conn.cursor() as conn:
+        conn.execute("""
+                     SELECT call_date FROM PLAYLIST_ID ORDER BY call_date DESC LIMIT 1
+                     """)
+        row = conn.fetchone()
+
+    if not row:
+        raise Exception("PLAYLIST_ID table is empty.")
+    
     today = date.today()
-    path = './playlist_id.json'
-    data = load_json(path)
-    last_call_str = data.get('call_date', '1900-01-01')
-    last_call_date = str_to_date(last_call_str)
+    last_call_date = str_to_date(row[0])
+    
     run_key = datetime.now(timezone.utc).isoformat()
     if today > last_call_date:
         yield dg.RunRequest(
@@ -31,6 +44,7 @@ def youtube_stats(context: dg.SensorEvaluationContext):
                 }
             }
         )
-    
-    yield dg.SkipReason(f"Data is up to date {today}")
+    else:
+        yield dg.SkipReason(f"Data is up to date {today}")
+        
     context.update_cursor(run_key)

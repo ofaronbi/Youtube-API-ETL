@@ -29,5 +29,11 @@ def format_duration(ISO_duration):
         return f"{h}:{int(m):02d}:{int(s):02d}"
     return f"{m}:{int(s):02d}"
 
+
 def str_to_date(date_str):
     return datetime.strptime(date_str, '%Y-%m-%d').date()
+
+
+def truncate_table(connection, table):
+    with connection.cursor() as conn:
+        conn.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE;")
