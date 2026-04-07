@@ -4,7 +4,6 @@ import os
 from ..helper import *
 
 
-
 YOUR_API_KEY = os.getenv("YOUR_API_KEY")
 CHANNEL_HANDLER = os.getenv("CHANNEL_HANDLER")
 MAX_RESULT = int(os.getenv("MAX_RESULT", 50))
@@ -12,48 +11,47 @@ MAX_RESULT = int(os.getenv("MAX_RESULT", 50))
 
 class CURRENTDATE(dg.Config):
     current_date: str
-        
-
-
-@dg.op(out={
-    'current_date': dg.Out(), 
-    'playlist_id' : dg.Out(),
-    'last_call_date' : dg.Out()
-})
-def get_playlist_id(config:CURRENTDATE):
-    path = './playlist_id.json'
-    data = load_json(path)
     
-    # Check if we need to refresh (if date is missing or old)
-    last_call_str = data.get('call_date', '1900-01-01')
-    last_call_date = str_to_date(last_call_str)
+
+@dg.op(out={'playlist_id': dg.Out()},
+    required_resource_keys={'postgres_db'}
+)
+def get_playlist_id(context:dg.OpExecutionContext, config:CURRENTDATE):
+    
+    db_conn = context.resources.postgres_db
     current_date = str_to_date(config.current_date)
-
-    if current_date > last_call_date:
-        url = f'https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={CHANNEL_HANDLER}&key={YOUR_API_KEY}'
-        response = requests.get(url)
-        response.raise_for_status()
-        new_data = response.json()
         
-        if 'items' in new_data:
-            new_data['call_date'] = str(current_date)
-            save_json(path, new_data)
-            data = new_data
+    context.log.info("Fetching new data from YouTube API...")
+    url = f'https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={CHANNEL_HANDLER}&key={YOUR_API_KEY}'
+    response = requests.get(url)
+    response.raise_for_status()
+    data = response.json()
+
+    uploads_id = data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    channel_id = data['items'][0]['id']
     
-    yield dg.Output(current_date, 'current_date')
-    yield dg.Output(data['items'][0]['contentDetails']['relatedPlaylists']['uploads'], 'playlist_id')
-    yield dg.Output(last_call_date, 'last_call_date')
+    truncate_table(db_conn, 'PLAYLIST_ID')
+
+    with db_conn.cursor() as conn:
+        conn.execute("""
+                INSERT INTO PLAYLIST_ID(channel_id, uploads_id, call_date)
+                VALUES(%s, %s, %s)
+                """, (channel_id, uploads_id, current_date))
+
+    yield dg.Output(uploads_id, 'playlist_id')
 
 
-@dg.op
-def get_playlist_video_ids(current_date, playlist_id, last_call_date):
-    path = "./playlist.json"
+@dg.op(required_resource_keys={'postgres_db'})
+def get_playlist_video_ids(context:dg.OpExecutionContext, playlist_id):
     
-    if current_date > last_call_date:
-        print("Fetching fresh playlist items...")
-        all_videos = []
-        page_token = None
-        
+    db_conn = context.resources.postgres_db
+    
+    truncate_table(db_conn, 'PLAYLIST_VIDEO_ID')
+    context.log.info("Fetching fresh playlist items...")
+    
+    page_token = None
+    
+    with db_conn.cursor() as conn:
         while True:
             params = {
                 "part": "contentDetails",
@@ -62,51 +60,79 @@ def get_playlist_video_ids(current_date, playlist_id, last_call_date):
                 "key": YOUR_API_KEY,
                 "pageToken": page_token
             }
-            response = requests.get("https://www.googleapis.com/youtube/v3/playlistItems", params=params)
+            response = requests.get(
+                "https://www.googleapis.com/youtube/v3/playlistItems", params=params)
             response.raise_for_status()
             data = response.json()
             
-            all_videos.extend([item["contentDetails"]["videoId"] for item in data.get("items", [])])
+            for item in data.get("items", []):
+                video_di = item["contentDetails"]["videoId"]
+                conn.execute("""
+                            INSERT INTO PLAYLIST_VIDEO_ID(video_id)
+                            VALUES(%s)
+                        """, (video_di,))
+
             page_token = data.get("nextPageToken")
-            if not page_token: break
-            
-        save_json(path, {"video_ids": all_videos})
-        return all_videos
+            if not page_token:
+                break
+                
+        context.log.info("Playlist video IDs saved to PLAYLIST_VIDEO_ID Database successfully.")
+                
+    with db_conn.cursor() as conn:
+        conn.execute("""
+                     SELECT video_id FROM PLAYLIST_VIDEO_ID
+                     """)
+        rows = conn.fetchall()
     
-    return load_json(path).get("video_ids", [])
+    return [row[0] for row in rows]
 
 
-@dg.op
-def fetch_full_video_details(video_ids):
-    print(f"Fetching details for {len(video_ids)} videos...")
-    all_details = []
-    
-    for index in range(0, len(video_ids), 50):
-        chunk_id = video_ids[index:index+50]
-        params = {
-            "part": "snippet,statistics,contentDetails",
-            "id": ",".join(chunk_id),
-            "key": YOUR_API_KEY
-        }
-        response = requests.get("https://www.googleapis.com/youtube/v3/videos", params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        for item in data.get("items", []):
-            statistics = item.get("statistics", {})
-            video_data = {
-                "video_id" : item["id"],
-                "channelTitle" : item["snippet"]["channelTitle"],
-                "title" : item["snippet"]["title"],
-                "publishedAt" : item["snippet"]["publishedAt"],
-                "description" : item["snippet"]["description"],
-                "duration" : format_duration(item["contentDetails"]["duration"]),
-                "viewCount" : statistics.get("viewCount", "0"),
-                "likeCount" : statistics.get("likeCount", "0"),
-                "commentCount" : statistics.get("commentCount", "0")
+@dg.op(required_resource_keys={"postgres_db"})
+def fetch_full_video_details(context:dg.OpExecutionContext, video_ids):
+    db_conn = context.resources.postgres_db
+    try:
+        context.log.info(f"Fetching details for {len(video_ids)} videos...")
+        truncate_table(db_conn, "YOUTUBE_VIDEOS")
+
+        for index in range(0, len(video_ids), MAX_RESULT):
+            chunk_id = video_ids[index:index + MAX_RESULT]
+            params = {
+                "part": "snippet,statistics,contentDetails",
+                "id": ",".join(chunk_id),
+                "key": YOUR_API_KEY
             }
-            
-            all_details.append(video_data)
+            response = requests.get(
+                "https://www.googleapis.com/youtube/v3/videos", params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            for item in data.get("items", []):
+                statistics = item.get("statistics", {})
+                video_id = item["id"]
+                channel_title = item["snippet"]["channelTitle"]
+                title = item["snippet"]["title"]
+                published_at = item["snippet"]["publishedAt"]
+                description = item["snippet"]["description"]
+                duration = format_duration(item["contentDetails"]["duration"])
+                view_count = statistics.get("viewCount", "0")
+                like_count = statistics.get("likeCount", "0")
+                comment_count = statistics.get("commentCount", "0")
+                image_url = item["snippet"]["thumbnails"]["high"]["url"]
+                
+                with db_conn.cursor() as conn:
+                    conn.execute("""
+                        INSERT INTO YOUTUBE_VIDEOS(video_id, channel_title, title, published_at, description, duration, image_url)
+                        VALUES(%s, %s, %s, %s, %s, %s, %s)
+                    """, (video_id, channel_title, title, published_at, description, duration, image_url))
+                    
+                    conn.execute("""
+                        INSERT INTO YOUTUBE_VIDEO_STATS(video_id, view_count, like_count, comment_count)
+                        VALUES(%s, %s, %s, %s)
+                    """, (video_id, int(view_count), int(like_count), int(comment_count)))
+                    
+        context.log.info("All tables ready.")
+    except:
+        raise dg.DagsterError
+
     
-    save_json("./video_data.json", all_details)
-    return all_details
+

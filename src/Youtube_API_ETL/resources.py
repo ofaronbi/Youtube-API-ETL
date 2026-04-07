@@ -1,11 +1,11 @@
-# import dagster as dg
-# from dagster_postgres import PostgresResource
+import dagster as dg
+import psycopg2, os
 
 
-# my_app_postgres_resource = PostgresResource(
-#     host=dg.EnvVar("PG_HOST"),
-#     port=dg.EnvVar.int("PG_PORT"), 
-#     username=dg.EnvVar("PG_USERNAME"),
-#     password=dg.EnvVar("PG_PASSWORD"),
-#     database=dg.EnvVar("PG_DATABASE"),
-# )
+
+@dg.resource
+def neon_postgres_resource(context):
+    conn = psycopg2.connect(os.getenv("NEON_POSTGRES_DB_URL"))
+    conn.autocommit = True
+    yield conn
+    conn.close()
